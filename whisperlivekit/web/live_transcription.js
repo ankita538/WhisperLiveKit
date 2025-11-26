@@ -228,7 +228,7 @@ function setupWebSocket() {
       websocket.send(JSON.stringify({
         command: "start",
         language: languageSelect.value,
-        console.log("Selected language to send:", selectedLang); // send selected language
+     // send selected language
       }));
       resolve();
     };
