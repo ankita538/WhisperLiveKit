@@ -722,17 +722,14 @@ async function toggleRecording() {
     }
     console.log("Connecting to WebSocket");
     try {
-      if (websocket && websocket.readyState === WebSocket.OPEN) {
-        await configReady;
-        await startRecording();
-      } else {
-        await setupWebSocket();
-        await configReady;
-        await startRecording();
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+      await setupWebSocket();   // #CORRECTED: connect first
       }
+      await configReady;          // #CORRECTED: wait for server config
+      await startRecording();     // #CORRECTED: only then start recording
     } catch (err) {
-      statusText.textContent = "Could not connect to WebSocket or access mic. Aborted.";
-      console.error(err);
+    statusText.textContent = "Could not connect to WebSocket or access mic. Aborted.";
+    console.error(err);
     }
   } else {
     console.log("Stopping recording");
