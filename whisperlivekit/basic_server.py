@@ -69,8 +69,24 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            message = await websocket.receive_bytes()
-            await audio_processor.process_audio(message)
+            # Use receive() to handle both JSON commands and audio bytes
+            msg = await websocket.receive()
+
+            # 1️⃣ Client sent JSON (e.g. {"command": "start", "lan": "sv"})
+            if msg["type"] == "json":
+                data = msg["json"]
+
+                if data.get("command") == "start":
+                    # store language for this session
+                    audio_processor.client_lan = data.get("lan", transcription_engine.args.lan)
+                    logger.info(f"Client selected language: {audio_processor.client_lan}")
+
+                continue  # wait for audio
+
+            # 2️⃣ Client sent audio bytes
+            elif msg["type"] == "bytes":
+                await audio_processor.process_audio(msg["bytes"])
+
     except KeyError as e:
         if 'bytes' in str(e):
             logger.warning(f"Client has closed the connection.")
