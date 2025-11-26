@@ -147,8 +147,9 @@ class SimulStreamingASR():
     """SimulStreaming backend with AlignAtt policy."""
     sep = ""
 
-    def __init__(self, logfile=sys.stderr, **kwargs):
+    def __init__(self, logfile=sys.stderr, lan: str = 'auto',**kwargs):
         self.logfile = logfile
+        self.lan = lan
         self.transcribe_kargs = {}
         
         for key, value in kwargs.items():

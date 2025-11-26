@@ -52,17 +52,29 @@ async def handle_websocket_results(websocket, results_generator):
 
 @app.websocket("/asr")
 async def websocket_endpoint(websocket: WebSocket):
-    global transcription_engine
-    audio_processor = AudioProcessor(transcription_engine=transcription_engine)
+    """
+    WebSocket endpoint for live ASR.
+    - Receives initial JSON with selected language.
+    - Streams audio bytes for transcription.
+    - Sends ASR results back to the client in real time.
+    """
     await websocket.accept()
     logger.info("WebSocket connection opened.")
 
+    # 1️⃣ Receive initial command with language
     try:
-        await websocket.send_json({"type": "config", "useAudioWorklet": bool(args.pcm_input)})
+        init_msg = await websocket.receive_json()
+        selected_lang = init_msg.get("lan", transcription_engine.args.lan)
+        logger.info(f"Client selected language: {selected_lang}")
     except Exception as e:
-        logger.warning(f"Failed to send config to client: {e}")
+        selected_lang = transcription_engine.args.lan
+        logger.warning(f"Failed to get initial language from client, defaulting to {selected_lang}: {e}")
 
-    results_generator = await audio_processor.create_tasks()
+    # 2️⃣ Create AudioProcessor with session-specific language
+    audio_processor = AudioProcessor(transcription_engine=transcription_engine, lan=selected_lang)
+
+    # 3️⃣ Start results handler in the background
+    results_generator = audio_processor.create_tasks()
     websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator))
 
     try:
@@ -73,45 +85,45 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Client disconnected.")
                 break
             except RuntimeError as e:
-                # This happens if receive is called after a disconnect message
+                # Happens if receive is called after disconnect
                 if "Cannot call \"receive\" once a disconnect message has been received" in str(e):
                     logger.info("Client already disconnected, breaking loop.")
                     break
                 else:
                     raise
 
-            # 1️⃣ JSON messages
-            if msg["type"] == "json":
-                data = msg["json"]
-                if data.get("command") == "start":
-                    audio_processor.client_lan = data.get("lan", transcription_engine.args.lan)
-                    logger.info(f"Client selected language: {audio_processor.client_lan}")
+            # 4️⃣ Handle JSON commands (e.g., start/stop)
+            if msg["type"] in ("json", "text"):
+                data = msg.get("json") or {}
+                command = data.get("command")
+                if command == "start":
+                    logger.info(f"Received start command from client: {data}")
+                    # Already initialized AudioProcessor with language
+                    continue
+                elif command == "stop":
+                    logger.info("Received stop command from client.")
+                    break
                 continue
 
-            # 2️⃣ Audio bytes
+            # 5️⃣ Handle audio bytes
             elif msg["type"] == "bytes":
                 await audio_processor.process_audio(msg["bytes"])
 
-    except KeyError as e:
-        if 'bytes' in str(e):
-            logger.warning(f"Client has closed the connection.")
-        else:
-            logger.error(f"Unexpected KeyError in websocket_endpoint: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Unexpected error in websocket_endpoint main loop: {e}", exc_info=True)
+        logger.exception(f"Unexpected error in WebSocket endpoint main loop: {e}")
     finally:
-        logger.info("Cleaning up WebSocket endpoint...")
+        logger.info("Cleaning up WebSocket session...")
         if not websocket_task.done():
             websocket_task.cancel()
         try:
             await websocket_task
         except asyncio.CancelledError:
-            logger.info("WebSocket results handler task was cancelled.")
+            logger.info("WebSocket results handler task cancelled.")
         except Exception as e:
             logger.warning(f"Exception while awaiting websocket_task completion: {e}")
 
         await audio_processor.cleanup()
-        logger.info("WebSocket endpoint cleaned up successfully.")
+        logger.info("WebSocket session cleaned up successfully.")
 
 def main():
     """Entry point for the CLI command."""
