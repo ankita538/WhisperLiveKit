@@ -55,95 +55,97 @@ async def get_all_from_queue(queue):
     else: #translation
         return items
 
-def __init__(self, *, lan: str = None, **kwargs):
-    """Initialize the audio processor with configuration, models, and state."""
-    
-    if 'transcription_engine' in kwargs and isinstance(kwargs['transcription_engine'], TranscriptionEngine):
-        models = kwargs['transcription_engine']
-    else:
-        models = TranscriptionEngine(**kwargs)
-    
-    # Audio processing settings
-    self.args = models.args
-    self.sample_rate = 16000
-    self.channels = 1
-    self.samples_per_sec = int(self.sample_rate * self.args.min_chunk_size)
-    self.bytes_per_sample = 2
-    self.bytes_per_sec = self.samples_per_sec * self.bytes_per_sample
-    self.max_bytes_per_sec = 32000 * 5  # 5 seconds of audio at 32 kHz
-    self.is_pcm_input = self.args.pcm_input
 
-    # **Store session-specific language**
-    self.session_lan = lan if lan else getattr(models.asr, 'lan', 'auto')
+class AudioProcessor:
+    def __init__(self, *, lan: str = None, **kwargs):
+        """Initialize the audio processor with configuration, models, and state."""
+        
+        if 'transcription_engine' in kwargs and isinstance(kwargs['transcription_engine'], TranscriptionEngine):
+            models = kwargs['transcription_engine']
+        else:
+            models = TranscriptionEngine(**kwargs)
+        
+        # Audio processing settings
+        self.args = models.args
+        self.sample_rate = 16000
+        self.channels = 1
+        self.samples_per_sec = int(self.sample_rate * self.args.min_chunk_size)
+        self.bytes_per_sample = 2
+        self.bytes_per_sec = self.samples_per_sec * self.bytes_per_sample
+        self.max_bytes_per_sec = 32000 * 5  # 5 seconds of audio at 32 kHz
+        self.is_pcm_input = self.args.pcm_input
 
-    # State management
-    self.is_stopping = False
-    self.silence = True
-    self.silence_duration = 0.0
-    self.start_silence = None
-    self.last_silence_dispatch_time = None
-    self.state = State()
-    self.lock = asyncio.Lock()
-    self.sep = " "  # Default separator
-    self.last_response_content = FrontData()
-    self.last_detected_speaker = None
-    self.speaker_languages = {}
-    self.diarization_before_transcription = False
+        # **Store session-specific language**
+        self.session_lan = lan if lan else getattr(models.asr, 'lan', 'auto')
 
-    self.segments = []
-    
-    if self.diarization_before_transcription:
-        self.cumulative_pcm = []
-        self.last_start = 0.0
-        self.last_end = 0.0
-    
-    # Models and processing
-    self.asr = models.asr
-    self.vac_model = models.vac_model
-    if self.args.vac:
-        self.vac = FixedVADIterator(models.vac_model)
-    else:
-        self.vac = None
-                     
-    self.ffmpeg_manager = None
-    self.ffmpeg_reader_task = None
-    self._ffmpeg_error = None
+        # State management
+        self.is_stopping = False
+        self.silence = True
+        self.silence_duration = 0.0
+        self.start_silence = None
+        self.last_silence_dispatch_time = None
+        self.state = State()
+        self.lock = asyncio.Lock()
+        self.sep = " "  # Default separator
+        self.last_response_content = FrontData()
+        self.last_detected_speaker = None
+        self.speaker_languages = {}
+        self.diarization_before_transcription = False
 
-    if not self.is_pcm_input:
-        self.ffmpeg_manager = FFmpegManager(
-            sample_rate=self.sample_rate,
-            channels=self.channels
-        )
-        async def handle_ffmpeg_error(error_type: str):
-            logger.error(f"FFmpeg error: {error_type}")
-            self._ffmpeg_error = error_type
-        self.ffmpeg_manager.on_error_callback = handle_ffmpeg_error
-         
-    self.transcription_queue = asyncio.Queue() if self.args.transcription else None
-    self.diarization_queue = asyncio.Queue() if self.args.diarization else None
-    self.translation_queue = asyncio.Queue() if self.args.target_language else None
-    self.pcm_buffer = bytearray()
-    self.total_pcm_samples = 0
+        self.segments = []
+        
+        if self.diarization_before_transcription:
+            self.cumulative_pcm = []
+            self.last_start = 0.0
+            self.last_end = 0.0
+        
+        # Models and processing
+        self.asr = models.asr
+        self.vac_model = models.vac_model
+        if self.args.vac:
+            self.vac = FixedVADIterator(models.vac_model)
+        else:
+            self.vac = None
+                        
+        self.ffmpeg_manager = None
+        self.ffmpeg_reader_task = None
+        self._ffmpeg_error = None
 
-    self.transcription_task = None
-    self.diarization_task = None
-    self.translation_task = None
-    self.watchdog_task = None
-    self.all_tasks_for_cleanup = []
-    
-    self.transcription = None
-    self.translation = None
-    self.diarization = None
+        if not self.is_pcm_input:
+            self.ffmpeg_manager = FFmpegManager(
+                sample_rate=self.sample_rate,
+                channels=self.channels
+            )
+            async def handle_ffmpeg_error(error_type: str):
+                logger.error(f"FFmpeg error: {error_type}")
+                self._ffmpeg_error = error_type
+            self.ffmpeg_manager.on_error_callback = handle_ffmpeg_error
+            
+        self.transcription_queue = asyncio.Queue() if self.args.transcription else None
+        self.diarization_queue = asyncio.Queue() if self.args.diarization else None
+        self.translation_queue = asyncio.Queue() if self.args.target_language else None
+        self.pcm_buffer = bytearray()
+        self.total_pcm_samples = 0
 
-    if self.args.transcription:
-        # **Set ASR model language before creating online processor**
-        models.asr.lan = self.session_lan
-        self.transcription = online_factory(self.args, models.asr)        
-        self.sep = self.transcription.asr.sep   
-    if self.args.diarization:
-        self.diarization = online_diarization_factory(self.args, models.diarization_model)
-    if models.translation_model:
-        self.translation = online_translation_factory(self.args, models.translation_model)
+        self.transcription_task = None
+        self.diarization_task = None
+        self.translation_task = None
+        self.watchdog_task = None
+        self.all_tasks_for_cleanup = []
+        
+        self.transcription = None
+        self.translation = None
+        self.diarization = None
+
+        if self.args.transcription:
+            # **Set ASR model language before creating online processor**
+            models.asr.lan = self.session_lan
+            self.transcription = online_factory(self.args, models.asr)        
+            self.sep = self.transcription.asr.sep   
+        if self.args.diarization:
+            self.diarization = online_diarization_factory(self.args, models.diarization_model)
+        if models.translation_model:
+            self.translation = online_translation_factory(self.args, models.translation_model)
 
 
     async def _push_silence_event(self, silence_buffer: Silence):
@@ -637,7 +639,7 @@ def __init__(self, *, lan: str = None, **kwargs):
         if not message:
             logger.info("Empty audio message received, initiating stop sequence.")
             self.is_stopping = True
-             
+            
             if self.transcription_queue:
                 await self.transcription_queue.put(SENTINEL)
 
