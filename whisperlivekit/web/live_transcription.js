@@ -227,7 +227,8 @@ function setupWebSocket() {
       statusText.textContent = "Connected to server.";
       websocket.send(JSON.stringify({
         command: "start",
-        language: languageSelect.value, // send selected language
+        language: languageSelect.value,
+        console.log("Selected language to send:", selectedLang); // send selected language
       }));
       resolve();
     };
