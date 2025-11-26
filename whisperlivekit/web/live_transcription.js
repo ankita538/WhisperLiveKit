@@ -45,6 +45,7 @@ const linesTranscriptDiv = document.getElementById("linesTranscript");
 const timerElement = document.querySelector(".timer");
 const themeRadios = document.querySelectorAll('input[name="theme"]');
 const microphoneSelect = document.getElementById("microphoneSelect");
+const languageSelect = document.getElementById("languageSelect");
 
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsDiv = document.querySelector(".settings");
@@ -224,6 +225,10 @@ function setupWebSocket() {
 
     websocket.onopen = () => {
       statusText.textContent = "Connected to server.";
+      websocket.send(JSON.stringify({
+        command: "start",
+        language: languageSelect.value, // send selected language
+      }));
       resolve();
     };
 
