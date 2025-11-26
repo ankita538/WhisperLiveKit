@@ -74,7 +74,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_processor = AudioProcessor(transcription_engine=transcription_engine, lan=selected_lang)
 
     # 3️⃣ Start results handler in the background
-    results_generator = audio_processor.create_tasks()
+    results_generator = await audio_processor.create_tasks()  # ✅ await here!
     websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator))
 
     try:
@@ -85,7 +85,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Client disconnected.")
                 break
             except RuntimeError as e:
-                # Happens if receive is called after disconnect
                 if "Cannot call \"receive\" once a disconnect message has been received" in str(e):
                     logger.info("Client already disconnected, breaking loop.")
                     break
@@ -98,7 +97,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 command = data.get("command")
                 if command == "start":
                     logger.info(f"Received start command from client: {data}")
-                    # Already initialized AudioProcessor with language
                     continue
                 elif command == "stop":
                     logger.info("Received stop command from client.")
@@ -124,6 +122,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await audio_processor.cleanup()
         logger.info("WebSocket session cleaned up successfully.")
+
 
 def main():
     """Entry point for the CLI command."""
