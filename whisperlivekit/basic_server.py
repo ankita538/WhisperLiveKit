@@ -53,9 +53,7 @@ async def handle_websocket_results(websocket, results_generator):
 @app.websocket("/asr")
 async def websocket_endpoint(websocket: WebSocket):
     global transcription_engine
-    audio_processor = AudioProcessor(
-        transcription_engine=transcription_engine,
-    )
+    audio_processor = AudioProcessor(transcription_engine=transcription_engine)
     await websocket.accept()
     logger.info("WebSocket connection opened.")
 
@@ -63,27 +61,34 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_json({"type": "config", "useAudioWorklet": bool(args.pcm_input)})
     except Exception as e:
         logger.warning(f"Failed to send config to client: {e}")
-            
+
     results_generator = await audio_processor.create_tasks()
     websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator))
 
     try:
         while True:
-            # Use receive() to handle both JSON commands and audio bytes
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                logger.info("Client disconnected.")
+                break
+            except RuntimeError as e:
+                # This happens if receive is called after a disconnect message
+                if "Cannot call \"receive\" once a disconnect message has been received" in str(e):
+                    logger.info("Client already disconnected, breaking loop.")
+                    break
+                else:
+                    raise
 
-            # 1️⃣ Client sent JSON (e.g. {"command": "start", "lan": "sv"})
+            # 1️⃣ JSON messages
             if msg["type"] == "json":
                 data = msg["json"]
-
                 if data.get("command") == "start":
-                    # store language for this session
                     audio_processor.client_lan = data.get("lan", transcription_engine.args.lan)
                     logger.info(f"Client selected language: {audio_processor.client_lan}")
+                continue
 
-                continue  # wait for audio
-
-            # 2️⃣ Client sent audio bytes
+            # 2️⃣ Audio bytes
             elif msg["type"] == "bytes":
                 await audio_processor.process_audio(msg["bytes"])
 
@@ -92,8 +97,6 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.warning(f"Client has closed the connection.")
         else:
             logger.error(f"Unexpected KeyError in websocket_endpoint: {e}", exc_info=True)
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected by client during message receiving loop.")
     except Exception as e:
         logger.error(f"Unexpected error in websocket_endpoint main loop: {e}", exc_info=True)
     finally:
@@ -106,7 +109,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info("WebSocket results handler task was cancelled.")
         except Exception as e:
             logger.warning(f"Exception while awaiting websocket_task completion: {e}")
-            
+
         await audio_processor.cleanup()
         logger.info("WebSocket endpoint cleaned up successfully.")
 
