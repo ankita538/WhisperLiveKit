@@ -526,21 +526,22 @@ function drawWaveform() {
   animationFrame = requestAnimationFrame(drawWaveform);
 }
 
+// Updated startRecording to use global selectedLanguage
 async function startRecording() {
   try {
-    // Initialize WebSocket connection if not already connected
     if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+      await setupWebSocket();
+    } else {
+      // If we have an existing connection, close it first
+      websocket.close();
+      await new Promise(resolve => {
+        if (!websocket) return resolve();
+        websocket.onclose = resolve;
+      });
       await setupWebSocket();
     }
 
-    // Get the selected language
-    const languageSelect = document.getElementById('languageSelect');
-    selectedLanguage = languageSelect ? languageSelect.value : 'auto';
-
-    // Disable language selection
-    if (languageSelect) languageSelect.disabled = true;
-
-    // Send the language with the start command
+    // Use the global selectedLanguage variable
     websocket.send(JSON.stringify({
       command: "start",
       language: selectedLanguage === 'auto' ? null : selectedLanguage
@@ -649,7 +650,7 @@ async function startRecording() {
       };
     } else {
       try {
-        recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus",audioBitsPerSecond: 16000 });
+        recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus", audioBitsPerSecond: 16000 });
       } catch (e) {
         recorder = new MediaRecorder(stream, { audioBitsPerSecond: 16000 });
       }
@@ -681,103 +682,76 @@ async function startRecording() {
   }
 }
 
+// Updated stopRecording to properly clean up
 async function stopRecording() {
-  if (wakeLock) {
-    try {
-      await wakeLock.release();
-    } catch (e) {
-      // ignore
-    }
-    wakeLock = null;
-  }
+  // Skip if already stopping
+  if (!isRecording && !waitingForStop) return;
 
+  wakeLock?.release().catch(() => { });
+  wakeLock = null;
   userClosing = true;
   waitingForStop = true;
 
-  if (websocket && websocket.readyState === WebSocket.OPEN) {
-    const emptyBlob = new Blob([], { type: "audio/webm" });
-    // Send an empty blob as the EOF marker (existing behavior)
-    websocket.send(emptyBlob);
-    // Also send an explicit stop command to ensure the server finalizes
-    // even if the empty blob arrives in a separate frame or is lost.
-    try {
-      websocket.send(JSON.stringify({ command: "stop" }));
-    } catch (err) {
-      console.warn("Failed to send explicit stop command over websocket:", err);
-    }
-    statusText.textContent = "Recording stopped. Processing final audio...";
+  // Stop any ongoing recording
+  if (recorder?.state !== 'inactive') {
+    recorder?.stop();
   }
+  recorder = null;
 
-  if (recorder) {
-    try {
-      recorder.stop();
-    } catch (e) {
-      console.warn("Error stopping recorder:", e);
-    }
-    recorder = null;
-  }
-
+  // Terminate worker if it exists
   if (recorderWorker) {
     recorderWorker.terminate();
     recorderWorker = null;
   }
 
-  if (workletNode) {
-    try {
-      workletNode.port.onmessage = null;
-    } catch (e) { }
-    try {
-      workletNode.disconnect();
-    } catch (e) { }
-    workletNode = null;
-  }
+  // Disconnect audio nodes
+  workletNode?.disconnect();
+  workletNode = null;
+  microphone?.disconnect();
+  microphone = null;
+  analyser = null;
 
-  if (microphone) {
-    microphone.disconnect();
-    microphone = null;
+  // Close audio contexts
+  if (audioContext?.state !== 'closed') {
+    await audioContext?.close().catch(console.error);
   }
+  audioContext = null;
 
-  if (analyser) {
-    analyser = null;
+  if (outputAudioContext?.state !== 'closed') {
+    await outputAudioContext?.close().catch(console.error);
   }
-
-  if (audioContext && audioContext.state !== "closed") {
-    try {
-      await audioContext.close();
-    } catch (e) {
-      console.warn("Could not close audio context:", e);
-    }
-    audioContext = null;
-  }
+  outputAudioContext = null;
 
   if (audioSource) {
     audioSource.disconnect();
     audioSource = null;
   }
 
-  if (outputAudioContext && outputAudioContext.state !== "closed") {
-    outputAudioContext.close()
-    outputAudioContext = null;
-  }
+  // Stop animation frame and timer
+  cancelAnimationFrame(animationFrame);
+  animationFrame = null;
+  clearInterval(timerInterval);
+  timerInterval = null;
 
-  if (animationFrame) {
-    cancelAnimationFrame(animationFrame);
-    animationFrame = null;
-  }
-
-  if (timerInterval) {
-    clearInterval(timerInterval);
-    timerInterval = null;
-  }
+  // Reset UI
   timerElement.textContent = "00:00";
   startTime = null;
-
   isRecording = false;
   updateUI();
+  languageSelect.disabled = false;
 
-  // Re-enable language selection if not already done
-  const languageSelect = document.getElementById('languageSelect');
-  if (languageSelect) languageSelect.disabled = false;
+  // Close WebSocket if needed
+  if (websocket && websocket.readyState === WebSocket.OPEN) {
+    try {
+      websocket.send(JSON.stringify({ command: "stop" }));
+      // Give some time for the server to process the stop command
+      await new Promise(resolve => setTimeout(resolve, 500));
+      websocket.close();
+    } catch (e) {
+      console.error("Error sending stop command:", e);
+      websocket.close();
+    }
+  }
 }
 
 async function toggleRecording() {
@@ -831,31 +805,40 @@ function updateUI() {
 // Add this code after the updateUI function (around line 810)
 updateUI();
 
-// 5. Add language change handler
+// 5. Updated language change handler
 document.addEventListener('DOMContentLoaded', () => {
   const languageSelect = document.getElementById('languageSelect');
   if (languageSelect) {
     languageSelect.value = 'auto'; // Set default
-    languageSelect.addEventListener('change', (e) => {
-      if (!isRecording) {
-        selectedLanguage = e.target.value;
-        statusText.textContent = `Language set to: ${languageSelect.options[languageSelect.selectedIndex].text}`;
+    languageSelect.addEventListener('change', async (e) => {
+      const newLanguage = e.target.value;
+      if (isRecording) {
+        // If recording, stop current session and restart with new language
+        statusText.textContent = `Switching to ${languageSelect.options[languageSelect.selectedIndex].text}...`;
+        await stopRecording();
+        // Small delay to ensure clean state
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await startRecording();
+      } else {
+        // If not recording, just update the selected language
+        selectedLanguage = newLanguage;
       }
+      statusText.textContent = `Language set to: ${languageSelect.options[languageSelect.selectedIndex].text}`;
     });
   }
+
+  // Enumerate microphones on load
+  enumerateMicrophones().catch(error => {
+    console.log("Could not enumerate microphones on load:", error);
+  });
 });
+
 recordButton.addEventListener("click", toggleRecording);
 
 if (microphoneSelect) {
   microphoneSelect.addEventListener("change", handleMicrophoneChange);
 }
-document.addEventListener('DOMContentLoaded', async () => {
-  try {
-    await enumerateMicrophones();
-  } catch (error) {
-    console.log("Could not enumerate microphones on load:", error);
-  }
-});
+
 navigator.mediaDevices.addEventListener('devicechange', async () => {
   console.log('Device change detected, re-enumerating microphones');
   try {
