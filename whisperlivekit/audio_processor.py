@@ -102,12 +102,19 @@ class AudioProcessor:
         self.samples_per_sec = int(self.sample_rate * self.args.min_chunk_size)
         self.bytes_per_sample = 2
         self.bytes_per_sec = self.samples_per_sec * self.bytes_per_sample
+        self.min_chunk_size = 0.05  # Process smaller chunks (50ms)
+        self.samples_per_chunk = int(self.sample_rate * self.min_chunk_size)
+        self.bytes_per_chunk = self.samples_per_chunk * self.bytes_per_sample
+        self.min_bytes_to_process = self.bytes_per_chunk  # Process immediately when we have a chunk
         # Allow earlier processing when client sends many small frames by
         # processing when we have at least a fraction of the configured
         # chunk size. This prevents long waits when the client fragments
         # data into many small websocket frames (observed as 86-byte frames).
         # Make threshold more aggressive so small frames don't cause long delays.
-        self.min_bytes_to_process = max(256, self.bytes_per_sec // 8)  # MODIFIED
+        self.vad_threshold = 0.3  # More sensitive to speech (lower = more sensitive)
+        self.min_silence_duration_ms = 300  # Shorter silence detection (was 500ms)
+        self.speech_pad_ms = 150  # Less padding around speech segments (was 200ms)
+        # self.min_bytes_to_process = max(256, self.bytes_per_sec // 8)  # MODIFIED
         self.max_bytes_per_sec = 32000 * 5  # 5 seconds of audio at 32 kHz
         self.is_pcm_input = self.args.pcm_input
 
@@ -571,6 +578,19 @@ class AudioProcessor:
                 logger.warning(f"Exception in diarization_processor: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
         logger.info("Diarization processor task finished.")
+
+    # Add this method to AudioProcessor class
+    async def monitor_memory(self):
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        while not self.is_stopping:
+            mem = process.memory_info().rss / 1024 / 1024  # MB
+            gpu_mem = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
+            logger.debug(f"Memory usage: {mem:.2f}MB RAM, {gpu_mem:.2f}MB GPU")
+            await asyncio.sleep(5)
+                
+        
 
     async def translation_processor(self):
         # the idea is to ignore diarization for the moment. We use only transcription tokens.

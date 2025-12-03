@@ -649,9 +649,9 @@ async function startRecording() {
       };
     } else {
       try {
-        recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus",audioBitsPerSecond: 16000 });
       } catch (e) {
-        recorder = new MediaRecorder(stream);
+        recorder = new MediaRecorder(stream, { audioBitsPerSecond: 16000 });
       }
       recorder.ondataavailable = (e) => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -660,7 +660,7 @@ async function startRecording() {
           }
         }
       };
-      recorder.start(chunkDuration);
+      recorder.start(50);
     }
 
     startTime = Date.now();

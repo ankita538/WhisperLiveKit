@@ -11,6 +11,7 @@ from whisperlivekit import (
 import asyncio
 import logging
 import json
+import torch  # Required for GPU cleanup
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -69,10 +70,6 @@ async def handle_websocket_results(websocket, results_generator):
             "WebSocket disconnected while handling results (client likely closed connection)."
         )
     except Exception as e:
-        # Some runtime errors are expected when the ASGI response has already
-        # been closed (for example: "Unexpected ASGI message 'websocket.send',
-        # after sending 'websocket.close' or response already completed.").
-        # Treat those as informational and avoid noisy tracebacks.
         msg = str(e)
         if isinstance(e, RuntimeError) and (
             "Unexpected ASGI message" in msg or "after sending 'websocket.close'" in msg
@@ -91,8 +88,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         # 1. Accept either a config request or the initial start message.
-        #    Some clients request server config immediately on open (type='config'),
-        #    so we support replying with server capabilities before the 'start' command.
         selected_lang = None
         while True:
             init_msg = await websocket.receive_json()
@@ -140,7 +135,7 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 message = await websocket.receive()
 
-                # Binary frames carry the bytes in the 'bytes' key (Starlette/FastAPI)
+                # Binary frames carry the bytes in the 'bytes' key
                 if message.get("bytes") is not None:
                     await audio_processor.process_audio(message["bytes"])
                     continue
@@ -174,7 +169,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Client disconnected")
                 break
             except Exception as e:
-                # Handle the specific case where receive() is called after a disconnect
                 msg = str(e)
                 if (
                     isinstance(e, RuntimeError)
@@ -185,7 +179,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "WebSocket receive called after disconnect; ending loop."
                     )
                     break
-                # Other exceptions should be logged but not crash the server
                 logger.error(f"Error processing message: {e}")
                 break
 
@@ -205,6 +198,29 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Error during WebSocket task cleanup: {e}")
 
         logger.info("WebSocket connection closed")
+
+
+# --- AudioProcessor cleanup modifications ---
+async def audio_processor_cleanup(self):
+    logger.info("Starting cleanup of AudioProcessor resources.")
+    self.is_stopping = True
+
+    # Clear any queued items
+    if hasattr(self, "transcription_queue"):
+        while not self.transcription_queue.empty():
+            try:
+                self.transcription_queue.get_nowait()
+                self.transcription_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+    # GPU memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# Patch the AudioProcessor class with the new cleanup
+AudioProcessor.cleanup = audio_processor_cleanup
 
 
 def main():
