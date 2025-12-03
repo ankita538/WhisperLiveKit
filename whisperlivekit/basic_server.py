@@ -2,11 +2,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from whisperlivekit import TranscriptionEngine, AudioProcessor, get_inline_ui_html, parse_args
+from whisperlivekit import (
+    TranscriptionEngine,
+    AudioProcessor,
+    get_inline_ui_html,
+    parse_args,
+)
 import asyncio
 import logging
+import json
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logging.getLogger().setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -14,13 +22,15 @@ logger.setLevel(logging.DEBUG)
 args = parse_args()
 transcription_engine = None
 
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):    
+async def lifespan(app: FastAPI):
     global transcription_engine
     transcription_engine = TranscriptionEngine(
         **vars(args),
     )
     yield
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -31,6 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 async def get():
     return HTMLResponse(get_inline_ui_html())
@@ -40,118 +51,196 @@ async def handle_websocket_results(websocket, results_generator):
     """Consumes results from the audio processor and sends them via WebSocket."""
     try:
         async for response in results_generator:
-            await websocket.send_json(response.to_dict())
+            try:
+                await websocket.send_json(response.to_dict())
+            except Exception as e:
+                # Client likely disconnected while we were sending results; stop
+                # the results loop silently to avoid tracebacks in the server logs.
+                logger.info(f"WebSocket send failed (client disconnected?): {e}")
+                return
         # when the results_generator finishes it means all audio has been processed
         logger.info("Results generator finished. Sending 'ready_to_stop' to client.")
-        await websocket.send_json({"type": "ready_to_stop"})
+        try:
+            await websocket.send_json({"type": "ready_to_stop"})
+        except Exception as e:
+            logger.info(f"WebSocket send failed while sending ready_to_stop: {e}")
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected while handling results (client likely closed connection).")
+        logger.info(
+            "WebSocket disconnected while handling results (client likely closed connection)."
+        )
     except Exception as e:
-        logger.exception(f"Error in WebSocket results handler: {e}")
+        # Some runtime errors are expected when the ASGI response has already
+        # been closed (for example: "Unexpected ASGI message 'websocket.send',
+        # after sending 'websocket.close' or response already completed.").
+        # Treat those as informational and avoid noisy tracebacks.
+        msg = str(e)
+        if isinstance(e, RuntimeError) and (
+            "Unexpected ASGI message" in msg or "after sending 'websocket.close'" in msg
+        ):
+            logger.info(f"WebSocket results handler ended: {msg}")
+        else:
+            logger.exception(f"Error in WebSocket results handler: {e}")
 
 
 @app.websocket("/asr")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for live ASR.
-    - Receives initial JSON with selected language.
-    - Streams audio bytes for transcription.
-    - Sends ASR results back to the client in real time.
-    """
+    """WebSocket endpoint for live ASR."""
     await websocket.accept()
     logger.info("WebSocket connection opened.")
-
-    # 1️⃣ Receive initial command with language
-    try:
-        init_msg = await websocket.receive_json()
-        selected_lang = init_msg.get("lan", transcription_engine.args.lan)
-        logger.info(f"Client selected language: {selected_lang}")
-    except Exception as e:
-        selected_lang = transcription_engine.args.lan
-        logger.warning(f"Failed to get initial language from client, defaulting to {selected_lang}: {e}")
-
-    # 2️⃣ Create AudioProcessor with session-specific language
-    audio_processor = AudioProcessor(transcription_engine=transcription_engine, lan=selected_lang)
-
-    # 3️⃣ Start results handler in the background
-    results_generator = await audio_processor.create_tasks()  # ✅ await here!
-    websocket_task = asyncio.create_task(handle_websocket_results(websocket, results_generator))
+    audio_processor = None
 
     try:
+        # 1. Accept either a config request or the initial start message.
+        #    Some clients request server config immediately on open (type='config'),
+        #    so we support replying with server capabilities before the 'start' command.
+        selected_lang = None
         while True:
-            try:
-                msg = await websocket.receive()
-            except WebSocketDisconnect:
-                logger.info("Client disconnected.")
-                break
-            except RuntimeError as e:
-                if "Cannot call \"receive\" once a disconnect message has been received" in str(e):
-                    logger.info("Client already disconnected, breaking loop.")
-                    break
-                else:
-                    raise
-
-            # 4️⃣ Handle JSON commands (e.g., start/stop)
-            if msg["type"] in ("json", "text"):
-                data = msg.get("json") or {}
-                command = data.get("command")
-                if command == "start":
-                    logger.info(f"Received start command from client: {data}")
-                    continue
-                elif command == "stop":
-                    logger.info("Received stop command from client.")
-                    break
+            init_msg = await websocket.receive_json()
+            # If client only wants server configuration, reply and continue waiting for start
+            if init_msg.get("type") == "config":
+                try:
+                    use_audio_worklet = bool(
+                        getattr(transcription_engine.args, "pcm_input", False)
+                    )
+                except Exception:
+                    use_audio_worklet = False
+                await websocket.send_json(
+                    {"type": "config", "useAudioWorklet": use_audio_worklet}
+                )
                 continue
 
-            # 5️⃣ Handle audio bytes
-            elif msg["type"] == "bytes":
-                await audio_processor.process_audio(msg["bytes"])
+            # Expect the start command to actually begin a session
+            if init_msg.get("command") == "start":
+                selected_lang = init_msg.get("language", transcription_engine.args.lan)
+                logger.info(
+                    f"Starting transcription with language: {selected_lang or 'auto'}"
+                )
+                break
+
+            # Unknown initial message: close with invalid data code
+            logger.error(
+                "First meaningful message must be a 'start' command or 'config' request"
+            )
+            await websocket.close(code=1003)
+            return
+
+        # 2. Initialize audio processor with the selected language
+        audio_processor = AudioProcessor(
+            transcription_engine=transcription_engine, lan=selected_lang
+        )
+
+        # 3. Create tasks for processing audio and handling results
+        results_generator = await audio_processor.create_tasks()
+        websocket_task = asyncio.create_task(
+            handle_websocket_results(websocket, results_generator)
+        )
+
+        # 4. Main loop for processing audio
+        while True:
+            try:
+                message = await websocket.receive()
+
+                # Binary frames carry the bytes in the 'bytes' key (Starlette/FastAPI)
+                if message.get("bytes") is not None:
+                    await audio_processor.process_audio(message["bytes"])
+                    continue
+
+                # Text frames are provided in the 'text' key; parse JSON if possible
+                if message.get("text") is not None:
+                    raw = message.get("text")
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        data = {}
+
+                    # allow runtime config queries
+                    if data.get("type") == "config":
+                        try:
+                            use_audio_worklet = bool(
+                                getattr(transcription_engine.args, "pcm_input", False)
+                            )
+                        except Exception:
+                            use_audio_worklet = False
+                        await websocket.send_json(
+                            {"type": "config", "useAudioWorklet": use_audio_worklet}
+                        )
+                        continue
+
+                    if data.get("command") == "stop":
+                        logger.info("Received stop command from client")
+                        break
+
+            except WebSocketDisconnect:
+                logger.info("Client disconnected")
+                break
+            except Exception as e:
+                # Handle the specific case where receive() is called after a disconnect
+                msg = str(e)
+                if (
+                    isinstance(e, RuntimeError)
+                    and 'Cannot call "receive" once a disconnect message has been received'
+                    in msg
+                ):
+                    logger.info(
+                        "WebSocket receive called after disconnect; ending loop."
+                    )
+                    break
+                # Other exceptions should be logged but not crash the server
+                logger.error(f"Error processing message: {e}")
+                break
 
     except Exception as e:
-        logger.exception(f"Unexpected error in WebSocket endpoint main loop: {e}")
+        logger.exception(f"Error in WebSocket handler: {e}")
     finally:
-        logger.info("Cleaning up WebSocket session...")
-        if not websocket_task.done():
+        # Cleanup
+        if audio_processor:
+            await audio_processor.cleanup()
+        if "websocket_task" in locals():
             websocket_task.cancel()
-        try:
-            await websocket_task
-        except asyncio.CancelledError:
-            logger.info("WebSocket results handler task cancelled.")
-        except Exception as e:
-            logger.warning(f"Exception while awaiting websocket_task completion: {e}")
+            try:
+                await websocket_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error during WebSocket task cleanup: {e}")
 
-        await audio_processor.cleanup()
-        logger.info("WebSocket session cleaned up successfully.")
+        logger.info("WebSocket connection closed")
 
 
 def main():
     """Entry point for the CLI command."""
     import uvicorn
-    
+
     uvicorn_kwargs = {
         "app": "whisperlivekit.basic_server:app",
-        "host":args.host, 
-        "port":args.port, 
+        "host": args.host,
+        "port": args.port,
         "reload": False,
         "log_level": "info",
         "lifespan": "on",
     }
-    
+
     ssl_kwargs = {}
     if args.ssl_certfile or args.ssl_keyfile:
         if not (args.ssl_certfile and args.ssl_keyfile):
-            raise ValueError("Both --ssl-certfile and --ssl-keyfile must be specified together.")
+            raise ValueError(
+                "Both --ssl-certfile and --ssl-keyfile must be specified together."
+            )
         ssl_kwargs = {
             "ssl_certfile": args.ssl_certfile,
-            "ssl_keyfile": args.ssl_keyfile
+            "ssl_keyfile": args.ssl_keyfile,
         }
 
     if ssl_kwargs:
         uvicorn_kwargs = {**uvicorn_kwargs, **ssl_kwargs}
     if args.forwarded_allow_ips:
-        uvicorn_kwargs = { **uvicorn_kwargs, "forwarded_allow_ips" : args.forwarded_allow_ips }
+        uvicorn_kwargs = {
+            **uvicorn_kwargs,
+            "forwarded_allow_ips": args.forwarded_allow_ips,
+        }
 
     uvicorn.run(**uvicorn_kwargs)
+
 
 if __name__ == "__main__":
     main()

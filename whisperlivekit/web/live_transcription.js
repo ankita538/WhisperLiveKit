@@ -7,7 +7,7 @@ const isWebContext = !isExtension;
 let isRecording = false;
 let websocket = null;
 let recorder = null;
-let chunkDuration = 100;
+let chunkDuration = 50;
 let websocketUrl = "ws://localhost:8000/asr";
 let userClosing = false;
 let wakeLock = null;
@@ -31,6 +31,9 @@ let configReadyResolve;
 const configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
+// 1. Add these variables at the top with other variables
+let selectedLanguage = 'auto';
+let isLanguageSet = false;
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -181,12 +184,12 @@ function fmt1(x) {
 let host, port, protocol;
 port = 8000;
 if (isExtension) {
-    host = "localhost";
-    protocol = "ws";
+  host = "localhost";
+  protocol = "ws";
 } else {
-    host = window.location.hostname || "localhost";
-    port = window.location.port;
-    protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  host = window.location.hostname || "localhost";
+  port = window.location.port;
+  protocol = window.location.protocol === "https:" ? "wss" : "ws";
 }
 const defaultWebSocketUrl = `${protocol}://${host}${port ? ":" + port : ""}/asr`;
 
@@ -216,6 +219,7 @@ websocketInput.addEventListener("change", () => {
 function setupWebSocket() {
   return new Promise((resolve, reject) => {
     try {
+      // Initialize WebSocket connection
       websocket = new WebSocket(websocketUrl);
     } catch (error) {
       statusText.textContent = "Invalid WebSocket URL. Please check and try again.";
@@ -224,12 +228,10 @@ function setupWebSocket() {
     }
 
     websocket.onopen = () => {
+      // Request server configuration only. The `start` command will be sent
+      // when the user actually starts recording (to avoid duplicate starts).
+      websocket.send(JSON.stringify({ type: "config" }));
       statusText.textContent = "Connected to server.";
-      websocket.send(JSON.stringify({
-        command: "start",
-        language: languageSelect.value,
-     // send selected language
-      }));
       resolve();
     };
 
@@ -238,7 +240,7 @@ function setupWebSocket() {
         if (waitingForStop) {
           statusText.textContent = "Processing finalized or connection closed.";
           if (lastReceivedData) {
-          renderLinesWithBuffer(
+            renderLinesWithBuffer(
               lastReceivedData.lines || [],
               lastReceivedData.buffer_diarization || "",
               lastReceivedData.buffer_transcription || "",
@@ -255,6 +257,8 @@ function setupWebSocket() {
           stopRecording();
         }
       }
+
+      // Reset states
       isRecording = false;
       waitingForStop = false;
       userClosing = false;
@@ -263,68 +267,80 @@ function setupWebSocket() {
       updateUI();
     };
 
-    websocket.onerror = () => {
+    websocket.onerror = (error) => {
+      console.error("WebSocket error:", error);
       statusText.textContent = "Error connecting to WebSocket.";
       reject(new Error("Error connecting to WebSocket"));
     };
 
     websocket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "config") {
-        serverUseAudioWorklet = !!data.useAudioWorklet;
-        statusText.textContent = serverUseAudioWorklet
-          ? "Connected. Using AudioWorklet (PCM)."
-          : "Connected. Using MediaRecorder (WebM).";
-        if (configReadyResolve) configReadyResolve();
-        return;
-      }
+      try {
+        const data = JSON.parse(event.data);
 
-      if (data.type === "ready_to_stop") {
-        console.log("Ready to stop received, finalizing display and closing WebSocket.");
-        waitingForStop = false;
-
-        if (lastReceivedData) {
-          renderLinesWithBuffer(
-            lastReceivedData.lines || [],
-            lastReceivedData.buffer_diarization || "",
-            lastReceivedData.buffer_transcription || "",
-            lastReceivedData.buffer_translation || "",
-            0,
-            0,
-            true
-          );
+        // Handle configuration response
+        if (data.type === "config") {
+          serverUseAudioWorklet = !!data.useAudioWorklet;
+          statusText.textContent = serverUseAudioWorklet
+            ? "Connected. Using AudioWorklet (PCM)."
+            : "Connected. Using MediaRecorder (WebM).";
+          if (configReadyResolve) configReadyResolve();
+          return;
         }
-        statusText.textContent = "Finished processing audio! Ready to record again.";
-        recordButton.disabled = false;
 
-        if (websocket) {
-          websocket.close();
+        // Handle ready_to_stop message
+        if (data.type === "ready_to_stop") {
+          console.log("Ready to stop received, finalizing display and closing WebSocket.");
+          waitingForStop = false;
+
+          if (lastReceivedData) {
+            renderLinesWithBuffer(
+              lastReceivedData.lines || [],
+              lastReceivedData.buffer_diarization || "",
+              lastReceivedData.buffer_transcription || "",
+              lastReceivedData.buffer_translation || "",
+              0,
+              0,
+              true
+            );
+          }
+          statusText.textContent = "Finished processing audio! Ready to record again.";
+          recordButton.disabled = false;
+
+          if (websocket) {
+            websocket.close();
+          }
+          return;
         }
-        return;
+
+        // Update last received data
+        lastReceivedData = data;
+
+        // Process the received data
+        const {
+          lines = [],
+          buffer_transcription = "",
+          buffer_diarization = "",
+          buffer_translation = "",
+          remaining_time_transcription = 0,
+          remaining_time_diarization = 0,
+          status = "active_transcription",
+        } = data;
+
+        // Update the UI with the received data
+        renderLinesWithBuffer(
+          lines,
+          buffer_diarization,
+          buffer_transcription,
+          buffer_translation,
+          remaining_time_diarization,
+          remaining_time_transcription,
+          false,
+          status
+        );
+
+      } catch (error) {
+        console.error("Error processing WebSocket message:", error);
       }
-
-      lastReceivedData = data;
-
-      const {
-        lines = [],
-        buffer_transcription = "",
-        buffer_diarization = "",
-        buffer_translation = "",
-        remaining_time_transcription = 0,
-        remaining_time_diarization = 0,
-        status = "active_transcription",
-      } = data;
-
-      renderLinesWithBuffer(
-        lines,
-        buffer_diarization,
-        buffer_transcription,
-        buffer_translation,
-        remaining_time_diarization,
-        remaining_time_transcription,
-        false,
-        status
-      );
     };
   });
 }
@@ -397,9 +413,9 @@ function renderLinesWithBuffer(
 
       if (idx === lines.length - 1) {
         if (!isFinalizing && item.speaker !== -2) {
-            speakerLabel += `<span class="label_transcription"><span class="spinner"></span>Transcription lag <span id='timeInfo'><span class="lag-transcription-value">${fmt1(
-              remaining_time_transcription
-            )}</span>s</span></span>`;
+          speakerLabel += `<span class="label_transcription"><span class="spinner"></span>Transcription lag <span id='timeInfo'><span class="lag-transcription-value">${fmt1(
+            remaining_time_transcription
+          )}</span>s</span></span>`;
 
           if (buffer_diarization && remaining_time_diarization) {
             speakerLabel += `<span class="label_diarization"><span class="spinner"></span>Diarization lag<span id='timeInfo'><span class="lag-diarization-value">${fmt1(
@@ -512,6 +528,29 @@ function drawWaveform() {
 
 async function startRecording() {
   try {
+    // Initialize WebSocket connection if not already connected
+    if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+      await setupWebSocket();
+    }
+
+    // Get the selected language
+    const languageSelect = document.getElementById('languageSelect');
+    selectedLanguage = languageSelect ? languageSelect.value : 'auto';
+
+    // Disable language selection
+    if (languageSelect) languageSelect.disabled = true;
+
+    // Send the language with the start command
+    websocket.send(JSON.stringify({
+      command: "start",
+      language: selectedLanguage === 'auto' ? null : selectedLanguage
+    }));
+
+    // Request server configuration
+    websocket.send(JSON.stringify({ type: "config" }));
+    await configReady;  // Wait for server config
+
+    // Try to acquire wake lock
     try {
       wakeLock = await navigator.wakeLock.request("screen");
     } catch (err) {
@@ -519,12 +558,12 @@ async function startRecording() {
     }
 
     let stream;
-    
+
     // chromium extension. in the future, both chrome page audio and mic will be used
     if (isExtension) {
       try {
         stream = await new Promise((resolve, reject) => {
-          chrome.tabCapture.capture({audio: true}, (s) => {
+          chrome.tabCapture.capture({ audio: true }, (s) => {
             if (s) {
               resolve(s);
             } else {
@@ -532,7 +571,7 @@ async function startRecording() {
             }
           });
         });
-        
+
         try {
           outputAudioContext = new (window.AudioContext || window.webkitAudioContext)();
           audioSource = outputAudioContext.createMediaStreamSource(stream);
@@ -540,7 +579,7 @@ async function startRecording() {
         } catch (audioError) {
           console.warn('could not preserve system audio:', audioError);
         }
-        
+
         statusText.textContent = "Using tab audio capture.";
       } catch (tabError) {
         console.log('Tab capture not available, falling back to microphone', tabError);
@@ -550,11 +589,19 @@ async function startRecording() {
         stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
         statusText.textContent = "Using microphone audio.";
       }
-    } else if (isWebContext) {
-      const audioConstraints = selectedMicrophoneId 
+    } else {
+      const audioConstraints = selectedMicrophoneId
         ? { audio: { deviceId: { exact: selectedMicrophoneId } } }
-        : { audio: true };
+        : {
+          audio: {
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        };
       stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+      statusText.textContent = "Using microphone audio.";
     }
 
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -568,7 +615,11 @@ async function startRecording() {
         throw new Error("AudioWorklet is not supported in this browser");
       }
       await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
-      workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
+      workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1
+      });
       microphone.connect(workletNode);
 
       recorderWorker = new Worker("/web/recorder_worker.js");
@@ -619,13 +670,14 @@ async function startRecording() {
     isRecording = true;
     updateUI();
   } catch (err) {
+    console.error("Error in startRecording:", err);
     if (window.location.hostname === "0.0.0.0") {
       statusText.textContent =
         "Error accessing microphone. Browsers may block microphone access on 0.0.0.0. Try using localhost:8000 instead.";
     } else {
       statusText.textContent = "Error accessing microphone. Please allow microphone access.";
     }
-    console.error(err);
+    await stopRecording();
   }
 }
 
@@ -644,7 +696,15 @@ async function stopRecording() {
 
   if (websocket && websocket.readyState === WebSocket.OPEN) {
     const emptyBlob = new Blob([], { type: "audio/webm" });
+    // Send an empty blob as the EOF marker (existing behavior)
     websocket.send(emptyBlob);
+    // Also send an explicit stop command to ensure the server finalizes
+    // even if the empty blob arrives in a separate frame or is lost.
+    try {
+      websocket.send(JSON.stringify({ command: "stop" }));
+    } catch (err) {
+      console.warn("Failed to send explicit stop command over websocket:", err);
+    }
     statusText.textContent = "Recording stopped. Processing final audio...";
   }
 
@@ -652,6 +712,7 @@ async function stopRecording() {
     try {
       recorder.stop();
     } catch (e) {
+      console.warn("Error stopping recorder:", e);
     }
     recorder = null;
   }
@@ -660,14 +721,14 @@ async function stopRecording() {
     recorderWorker.terminate();
     recorderWorker = null;
   }
-  
+
   if (workletNode) {
     try {
       workletNode.port.onmessage = null;
-    } catch (e) {}
+    } catch (e) { }
     try {
       workletNode.disconnect();
-    } catch (e) {}
+    } catch (e) { }
     workletNode = null;
   }
 
@@ -713,28 +774,34 @@ async function stopRecording() {
 
   isRecording = false;
   updateUI();
+
+  // Re-enable language selection if not already done
+  const languageSelect = document.getElementById('languageSelect');
+  if (languageSelect) languageSelect.disabled = false;
 }
 
 async function toggleRecording() {
   if (!isRecording) {
     if (waitingForStop) {
-      console.log("Waiting for stop, early return");
+      console.log("Waiting for previous recording to fully stop");
       return;
     }
-    console.log("Connecting to WebSocket");
+    console.log("Starting new recording");
     try {
-      if (!websocket || websocket.readyState !== WebSocket.OPEN) {
-      await setupWebSocket();   // #CORRECTED: connect first
-      }
-      await configReady;          // #CORRECTED: wait for server config
-      await startRecording();     // #CORRECTED: only then start recording
+      await startRecording();
     } catch (err) {
-    statusText.textContent = "Could not connect to WebSocket or access mic. Aborted.";
-    console.error(err);
+      console.error("Error in toggleRecording (start):", err);
+      statusText.textContent = "Error starting recording. Please check console for details.";
+      await stopRecording();
     }
   } else {
     console.log("Stopping recording");
-    stopRecording();
+    try {
+      await stopRecording();
+    } catch (err) {
+      console.error("Error in toggleRecording (stop):", err);
+      statusText.textContent = "Error stopping recording. Please check console for details.";
+    }
   }
 }
 
@@ -761,6 +828,22 @@ function updateUI() {
   }
 }
 
+// Add this code after the updateUI function (around line 810)
+updateUI();
+
+// 5. Add language change handler
+document.addEventListener('DOMContentLoaded', () => {
+  const languageSelect = document.getElementById('languageSelect');
+  if (languageSelect) {
+    languageSelect.value = 'auto'; // Set default
+    languageSelect.addEventListener('change', (e) => {
+      if (!isRecording) {
+        selectedLanguage = e.target.value;
+        statusText.textContent = `Language set to: ${languageSelect.options[languageSelect.selectedIndex].text}`;
+      }
+    });
+  }
+});
 recordButton.addEventListener("click", toggleRecording);
 
 if (microphoneSelect) {
@@ -784,8 +867,8 @@ navigator.mediaDevices.addEventListener('devicechange', async () => {
 
 
 settingsToggle.addEventListener("click", () => {
-settingsDiv.classList.toggle("visible");
-settingsToggle.classList.toggle("active");
+  settingsDiv.classList.toggle("visible");
+  settingsToggle.classList.toggle("active");
 });
 
 if (isExtension) {
