@@ -60,6 +60,7 @@ async def get_all_from_queue(queue):
     items.append(first_item)
 
     while True:
+        # Use non-blocking inspection to group multiple small frames together
         if not queue._queue:
             break
         next_item = queue._queue[0]
@@ -71,7 +72,7 @@ async def get_all_from_queue(queue):
         queue.task_done()
     if isinstance(items[0], np.ndarray):
         return np.concatenate(items)
-    else:  # translation
+    else:  # translation or tokens list
         return items
 
 
@@ -105,7 +106,8 @@ class AudioProcessor:
         # processing when we have at least a fraction of the configured
         # chunk size. This prevents long waits when the client fragments
         # data into many small websocket frames (observed as 86-byte frames).
-        self.min_bytes_to_process = max(512, self.bytes_per_sec // 4)
+        # Make threshold more aggressive so small frames don't cause long delays.
+        self.min_bytes_to_process = max(256, self.bytes_per_sec // 8)  # MODIFIED
         self.max_bytes_per_sec = 32000 * 5  # 5 seconds of audio at 32 kHz
         self.is_pcm_input = self.args.pcm_input
 
@@ -419,7 +421,6 @@ class AudioProcessor:
                     )
                 elif isinstance(item, ChangeSpeaker):
                     self.transcription.new_speaker(item)
-                    # self.transcription_queue.task_done()
                     continue
                 elif isinstance(item, np.ndarray):
                     pcm_array = item
@@ -428,9 +429,11 @@ class AudioProcessor:
                         len(pcm_array) / self.sample_rate
                     )
                     stream_time_end_of_current_pcm = cumulative_pcm_duration_stream_time
+                    # Insert audio chunk and process (offload heavy work to thread)
                     self.transcription.insert_audio_chunk(
                         pcm_array, stream_time_end_of_current_pcm
                     )
+                    # Use to_thread to avoid blocking event loop. it's okay if process_iter is CPU heavy.
                     new_tokens, current_audio_processed_upto = await asyncio.to_thread(
                         self.transcription.process_iter
                     )
@@ -442,19 +445,23 @@ class AudioProcessor:
                             f"TRANSCRIPTION OUTPUT: {len(new_tokens)} tokens: {token_texts}"
                         )
                     else:
-                        logger.debug(
-                            f"No tokens from process_iter; buffer: {self.transcription.get_buffer()}"
-                        )
+                        # More debugging: log buffer state if no tokens arrived.
+                        try:
+                            logger.debug(
+                                f"No tokens from process_iter; buffer length: {len(getattr(self.transcription, 'audio_buffer', []))}"
+                            )
+                        except Exception:
+                            logger.debug("No tokens and cannot inspect buffer.")
                 else:
                     continue
-                    return
 
                 _buffer_transcript = self.transcription.get_buffer()
-                buffer_text = _buffer_transcript.text
+                buffer_text = getattr(_buffer_transcript, "text", "")  # MODIFIED
 
                 if new_tokens:
                     validated_text = self.sep.join([t.text for t in new_tokens])
                     if buffer_text.startswith(validated_text):
+                        # Trim validated prefix from buffer to avoid duplication
                         _buffer_transcript.text = buffer_text[
                             len(validated_text) :
                         ].lstrip()
@@ -480,10 +487,9 @@ class AudioProcessor:
             except Exception as e:
                 logger.warning(f"Exception in transcription_processor: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
-                if (
-                    "pcm_array" in locals() and pcm_array is not SENTINEL
-                ):  # Check if pcm_array was assigned from queue
-                    self.transcription_queue.task_done()
+                # avoid infinite loop if an exception happens; continue processing next items
+                await asyncio.sleep(0.05)
+                continue
 
         if self.is_stopping:
             logger.info("Transcription processor finishing due to stopping flag.")
@@ -614,9 +620,9 @@ class AudioProcessor:
                     state, self.silence, args=self.args, sep=self.sep
                 )
                 if lines and lines[-1].speaker == -2:
-                    buffer_transcription = Transcript()
+                    buffer_transcription_obj = Transcript()
                 else:
-                    buffer_transcription = state.buffer_transcription
+                    buffer_transcription_obj = state.buffer_transcription
 
                 buffer_diarization = ""
                 if undiarized_text:
@@ -625,6 +631,7 @@ class AudioProcessor:
                     async with self.lock:
                         self.state.end_attributed_speaker = state.end_attributed_speaker
 
+                # Make buffer translation robust
                 buffer_translation_text = ""
                 if state.buffer_translation:
                     raw_buffer_translation = getattr(
@@ -633,10 +640,21 @@ class AudioProcessor:
                     if raw_buffer_translation:
                         buffer_translation_text = raw_buffer_translation.strip()
 
+                # Make buffer transcription creation robust to None or missing .text
+                raw_buffer_transcription = ""
+                try:
+                    raw_buffer_transcription = getattr(
+                        buffer_transcription_obj, "text", buffer_transcription_obj
+                    )
+                    if raw_buffer_transcription is None:
+                        raw_buffer_transcription = ""
+                except Exception:
+                    raw_buffer_transcription = ""
+
                 response_status = "active_transcription"
                 if (
                     not state.tokens
-                    and not buffer_transcription
+                    and not raw_buffer_transcription
                     and not buffer_diarization
                 ):
                     response_status = "no_audio_detected"
@@ -649,7 +667,7 @@ class AudioProcessor:
                 response = FrontData(
                     status=response_status,
                     lines=lines,
-                    buffer_transcription=buffer_transcription.text.strip(),
+                    buffer_transcription=(raw_buffer_transcription or "").strip(),
                     buffer_diarization=buffer_diarization,
                     buffer_translation=buffer_translation_text,
                     remaining_time_transcription=state.remaining_time_transcription,
@@ -661,7 +679,10 @@ class AudioProcessor:
                 should_push = response != self.last_response_content
                 if should_push and (
                     lines
-                    or buffer_transcription
+                    or (
+                        response.buffer_transcription
+                        and len(response.buffer_transcription) > 0
+                    )
                     or buffer_diarization
                     or response_status == "no_audio_detected"
                 ):
@@ -674,13 +695,14 @@ class AudioProcessor:
                     )
                     return
 
-                await asyncio.sleep(0.05)
+                # Poll more frequently for lower latency UI updates
+                await asyncio.sleep(0.02)  # MODIFIED
 
             except Exception as e:
                 logger.warning(
                     f"Exception in results_formatter. Traceback: {traceback.format_exc()}"
                 )
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)  # MODIFIED
 
     async def create_tasks(self):
         """Create and start processing tasks."""
