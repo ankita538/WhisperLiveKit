@@ -48,10 +48,23 @@ class ASRToken(TimedText):
     validated_speaker: bool = False
     validated_text: bool = False
     validated_language: bool = False
+    confidence: Optional[float] = None
+    token_id: Optional[str] = None
+    source_buffer_id: Optional[str] = None
     
     def with_offset(self, offset: float) -> "ASRToken":
         """Return a new token with the time offset added."""
-        return ASRToken(self.start + offset, self.end + offset, self.text, self.speaker, self.probability, detected_language=self.detected_language)
+        return ASRToken(
+            start=self.start + offset, 
+            end=self.end + offset, 
+            text=self.text, 
+            speaker=self.speaker, 
+            probability=self.probability, 
+            detected_language=self.detected_language,
+            confidence=self.confidence,
+            token_id=self.token_id,
+            source_buffer_id=self.source_buffer_id
+        )
 
 @dataclass
 class Sentence(TimedText):

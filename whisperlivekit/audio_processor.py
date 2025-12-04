@@ -4,6 +4,7 @@ from time import time, sleep
 import math
 import logging
 import traceback
+import uuid
 from whisperlivekit.timed_objects import (
     ASRToken,
     Silence,
@@ -22,6 +23,8 @@ from whisperlivekit.core import (
 from whisperlivekit.silero_vad_iterator import FixedVADIterator
 from whisperlivekit.results_formater import format_output
 from whisperlivekit.ffmpeg_manager import FFmpegManager, FFmpegState
+from whisperlivekit.token_processing_state import TokenProcessingState
+from whisperlivekit.trail_repetition import trim_tail_repetition
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -131,6 +134,9 @@ class AudioProcessor:
         self.last_detected_speaker = None
         self.speaker_languages = {}
         self.diarization_before_transcription = False
+        
+        # Token processing and deduplication state
+        self.token_processing_state = TokenProcessingState()
 
         self.segments = []
 
@@ -235,6 +241,14 @@ class AudioProcessor:
         now = time()
         self.start_silence = now
         self.last_silence_dispatch_time = now
+        
+        # Handle silence state transition
+        finalized_tokens = self.token_processing_state.silence_state.enter_silence(now)
+        if finalized_tokens:
+            logger.debug(f"Finalizing {len(finalized_tokens)} tokens before silence")
+            async with self.lock:
+                self.state.tokens.extend(finalized_tokens)
+        
         await self._push_silence_event(Silence(is_starting=True))
 
     async def _end_silence(self):
