@@ -663,23 +663,11 @@ async function startRecording() {
       };
       recorder.start(50);
     }
-
-    startTime = Date.now();
-    timerInterval = setInterval(updateTimer, 1000);
-    drawWaveform();
-
-    isRecording = true;
-    updateUI();
-  } catch (err) {
-    console.error("Error in startRecording:", err);
-    if (window.location.hostname === "0.0.0.0") {
-      statusText.textContent =
-        "Error accessing microphone. Browsers may block microphone access on 0.0.0.0. Try using localhost:8000 instead.";
-    } else {
-      statusText.textContent = "Error accessing microphone. Please allow microphone access.";
-    }
-    await stopRecording();
+  } else {
+    statusText.textContent = "Error accessing microphone. Please allow microphone access.";
   }
+  await stopRecording();
+}
 }
 
 // Updated stopRecording to properly clean up
@@ -803,34 +791,6 @@ function updateUI() {
 }
 
 // Add this code after the updateUI function (around line 810)
-updateUI();
-
-// 5. Updated language change handler
-document.addEventListener('DOMContentLoaded', () => {
-  const languageSelect = document.getElementById('languageSelect');
-  if (languageSelect) {
-    languageSelect.value = 'auto'; // Set default
-    languageSelect.addEventListener('change', async (e) => {
-      const newLanguage = e.target.value;
-      if (isRecording) {
-        // If recording, stop current session and restart with new language
-        statusText.textContent = `Switching to ${languageSelect.options[languageSelect.selectedIndex].text}...`;
-        await stopRecording();
-        // Small delay to ensure clean state
-        await new Promise(resolve => setTimeout(resolve, 500));
-        await startRecording();
-      } else {
-        // If not recording, just update the selected language
-        selectedLanguage = newLanguage;
-      }
-      statusText.textContent = `Language set to: ${languageSelect.options[languageSelect.selectedIndex].text}`;
-    });
-  }
-
-  // Enumerate microphones on load
-  enumerateMicrophones().catch(error => {
-    console.log("Could not enumerate microphones on load:", error);
-  });
 });
 
 recordButton.addEventListener("click", toggleRecording);
