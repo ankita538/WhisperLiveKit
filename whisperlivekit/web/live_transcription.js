@@ -7,7 +7,7 @@ const isWebContext = !isExtension;
 let isRecording = false;
 let websocket = null;
 let recorder = null;
-let chunkDuration = 50;
+let chunkDuration = 25; // Reduced from 50ms to 25ms for faster streaming
 let websocketUrl = "ws://localhost:8000/asr";
 let userClosing = false;
 let wakeLock = null;
@@ -664,7 +664,7 @@ async function startRecording() {
           }
         }
       };
-      recorder.start(50);
+      recorder.start(25); // Reduced from 50ms to 25ms for faster streaming
     }
 
     // Set recording state and start UI updates
@@ -817,11 +817,12 @@ function handleLanguageChange() {
 
   // If currently recording, restart with new language
   if (isRecording) {
-    statusText.textContent = "Switching language... Please wait.";
+    statusText.textContent = `Switching to ${selectedLanguage === 'auto' ? 'Auto-Detect' : selectedLanguage.toUpperCase()}... Please wait.`;
     stopRecording().then(() => {
       setTimeout(() => {
+        statusText.textContent = "Restarting with new language...";
         toggleRecording();
-      }, 1000);
+      }, 500); // Reduced delay from 1000ms to 500ms
     });
   }
 }
