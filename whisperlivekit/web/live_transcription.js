@@ -276,6 +276,7 @@ function setupWebSocket() {
     websocket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log("Received WebSocket message:", data);
 
         // Handle configuration response
         if (data.type === "config") {
@@ -542,10 +543,12 @@ async function startRecording() {
     }
 
     // Use the global selectedLanguage variable
-    websocket.send(JSON.stringify({
+    const startCommand = {
       command: "start",
       language: selectedLanguage === 'auto' ? null : selectedLanguage
-    }));
+    };
+    console.log("Sending start command:", startCommand);
+    websocket.send(JSON.stringify(startCommand));
 
     // Request server configuration
     websocket.send(JSON.stringify({ type: "config" }));
@@ -663,11 +666,21 @@ async function startRecording() {
       };
       recorder.start(50);
     }
-  } else {
+
+    // Set recording state and start UI updates
+    isRecording = true;
+    languageSelect.disabled = true;
+    startTime = Date.now();
+    timerInterval = setInterval(updateTimer, 1000);
+    drawWaveform();
+    updateUI();
+    console.log("Recording started successfully, isRecording:", isRecording);
+
+  } catch (error) {
+    console.error("Error starting recording:", error);
     statusText.textContent = "Error accessing microphone. Please allow microphone access.";
+    await stopRecording();
   }
-  await stopRecording();
-}
 }
 
 // Updated stopRecording to properly clean up
@@ -790,14 +803,40 @@ function updateUI() {
   }
 }
 
-// Add this code after the updateUI function (around line 810)
-});
-
 recordButton.addEventListener("click", toggleRecording);
 
 if (microphoneSelect) {
   microphoneSelect.addEventListener("change", handleMicrophoneChange);
 }
+
+// Add language change handler
+function handleLanguageChange() {
+  selectedLanguage = languageSelect.value;
+  localStorage.setItem('selectedLanguage', selectedLanguage);
+  console.log(`Selected language: ${selectedLanguage}`);
+
+  // If currently recording, restart with new language
+  if (isRecording) {
+    statusText.textContent = "Switching language... Please wait.";
+    stopRecording().then(() => {
+      setTimeout(() => {
+        toggleRecording();
+      }, 1000);
+    });
+  }
+}
+
+if (languageSelect) {
+  // Load saved language preference
+  const savedLanguage = localStorage.getItem('selectedLanguage') || 'auto';
+  languageSelect.value = savedLanguage;
+  selectedLanguage = savedLanguage;
+
+  languageSelect.addEventListener("change", handleLanguageChange);
+}
+
+// Initialize microphones on page load
+enumerateMicrophones();
 
 navigator.mediaDevices.addEventListener('devicechange', async () => {
   console.log('Device change detected, re-enumerating microphones');
