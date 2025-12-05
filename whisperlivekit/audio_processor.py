@@ -137,6 +137,10 @@ class AudioProcessor:
         
         # Token processing and deduplication state
         self.token_processing_state = TokenProcessingState()
+        
+        # Configuration for deduplication (can be made configurable via args)
+        self.deduplication_enabled = getattr(self.args, 'enable_deduplication', True)
+        self.repetition_detection_enabled = getattr(self.args, 'enable_repetition_detection', True)
 
         self.segments = []
 
@@ -247,7 +251,18 @@ class AudioProcessor:
         if finalized_tokens:
             logger.debug(f"Finalizing {len(finalized_tokens)} tokens before silence")
             async with self.lock:
-                self.state.tokens.extend(finalized_tokens)
+                # Apply deduplication to finalized tokens as well
+                filtered_finalized = []
+                for token in finalized_tokens:
+                    if not self.token_processing_state.deduplicator.is_duplicate(token):
+                        filtered_finalized.append(token)
+                        self.token_processing_state.deduplicator.add_validated_token(token)
+                    else:
+                        logger.debug(f"Filtered duplicate finalized token: '{token.text}' at {token.start:.2f}s")
+                
+                if filtered_finalized:
+                    self.state.tokens.extend(filtered_finalized)
+                    logger.debug(f"Added {len(filtered_finalized)} finalized tokens after deduplication")
         
         await self._push_silence_event(Silence(is_starting=True))
 
@@ -265,6 +280,9 @@ class AudioProcessor:
         self.silence = False
         self.start_silence = None
         self.last_silence_dispatch_time = None
+        
+        # Handle silence exit in token processing state
+        self.token_processing_state.silence_state.exit_silence(now)
 
     async def _enqueue_active_audio(self, pcm_chunk: np.ndarray):
         if pcm_chunk is None or pcm_chunk.size == 0:
@@ -498,7 +516,46 @@ class AudioProcessor:
                 candidate_end_times.append(current_audio_processed_upto)
 
                 async with self.lock:
-                    self.state.tokens.extend(new_tokens)
+                    # Apply deduplication and trail repetition detection before adding tokens
+                    if new_tokens:
+                        # Filter out duplicate tokens
+                        filtered_tokens = []
+                        for token in new_tokens:
+                            if not self.token_processing_state.deduplicator.is_duplicate(token):
+                                filtered_tokens.append(token)
+                                self.token_processing_state.deduplicator.add_validated_token(token)
+                            else:
+                                logger.debug(f"Filtered duplicate token: '{token.text}' at {token.start:.2f}s")
+                        
+                        # Apply trail repetition detection to the combined token stream
+                        if filtered_tokens:
+                            # Get recent tokens for context
+                            recent_tokens = self.state.tokens[-20:] if self.state.tokens else []
+                            combined_tokens = recent_tokens + filtered_tokens
+                            
+                            # Apply trail repetition trimming
+                            trimmed_tokens, was_trimmed = trim_tail_repetition(
+                                combined_tokens,
+                                key=lambda t: t.text,
+                                min_block=1,
+                                max_tail=50,
+                                prefer="longest",
+                                keep=1
+                            )
+                            
+                            if was_trimmed:
+                                logger.info(f"Trail repetition detected and trimmed. Original: {len(combined_tokens)}, Trimmed: {len(trimmed_tokens)}")
+                                # Replace recent tokens with trimmed version
+                                tokens_to_add = trimmed_tokens[len(recent_tokens):]
+                                if len(recent_tokens) > 0:
+                                    self.state.tokens = self.state.tokens[:-len(recent_tokens)] + trimmed_tokens[:len(recent_tokens)]
+                            else:
+                                tokens_to_add = filtered_tokens
+                            
+                            self.state.tokens.extend(tokens_to_add)
+                        
+                        logger.debug(f"Added {len(filtered_tokens)} tokens after deduplication (original: {len(new_tokens)})")
+                    
                     self.state.buffer_transcription = _buffer_transcript
                     self.state.end_buffer = max(candidate_end_times)
 
